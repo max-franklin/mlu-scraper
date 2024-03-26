@@ -1,0 +1,7 @@
+{
+    "ScrapeBaseUrl": "http://www.masterunitlist.info",
+    "UnitFilterPath": "/Unit/Filter",
+    "UnitDetailPath": "/Unit/Details",
+    "UnitCustomCardPath": "/Tools/CustomCard",
+    "BattleMechFilter": "Name=&HasBV=false&MinTons=&MaxTons=&MinBV=&MaxBV=&MinIntro=&MaxIntro=&MinCost=&MaxCost=&HasBFAbility=&MinPV=&MaxPV=&Types=18&BookAuto=&FactionAuto=&Eras=257"
+}
