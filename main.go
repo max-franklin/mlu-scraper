@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -118,52 +121,143 @@ func main() {
 
 	log.Printf("Successfully read configuration file: %+v\n", config)
 
-	// Make unit filter request
-	response, err := http.Get(fmt.Sprintf("%v%v?%v", config.ScrapeBaseUrl, config.UnitFilterPath, config.BattleMechFilter))
-	if err != nil {
-		log.Fatalf("Encountered error making request to MLU: %v\n", err)
-	}
-
-	defer response.Body.Close()
-
-	filterResponse, err := io.ReadAll(response.Body)
-	if err != nil {
-		log.Fatalf("Encountered error reading request response: %v\n", err)
-	}
-
-	re, err := regexp.Compile(`"/Unit/Details/(\d+)/(.*)"`)
-	if err != nil {
-		log.Fatalf("Failed to compile regexp for matching against scraped page: %v\n", err)
-	}
-
-	reMatches := re.FindAllSubmatch(filterResponse, -1)
-
 	unitsToSearchFor := []*Unit{}
 
-	for _, submatchSlice := range reMatches {
-		unit := &Unit{
-			Id:          string(submatchSlice[1]),
-			Designation: string(submatchSlice[2]),
+	remaining_units_bytes, err := os.ReadFile("remaining_units.json")
+	if err != nil && os.IsNotExist(err) {
+		log.Printf("Didn't detect any progress files to resume from, starting a fresh filter request\n")
+		// Make unit filter request
+		response, err := http.Get(fmt.Sprintf("%v%v?%v", config.ScrapeBaseUrl, config.UnitFilterPath, config.BattleMechFilter))
+		if err != nil {
+			log.Fatalf("Encountered error making request to MLU: %v\n", err)
 		}
-		unitsToSearchFor = append(unitsToSearchFor, unit)
+
+		defer response.Body.Close()
+
+		filterResponse, err := io.ReadAll(response.Body)
+		if err != nil {
+			log.Fatalf("Encountered error reading request response: %v\n", err)
+		}
+
+		re, err := regexp.Compile(`"/Unit/Details/(\d+)/(.*)"`)
+		if err != nil {
+			log.Fatalf("Failed to compile regexp for matching against scraped page: %v\n", err)
+		}
+
+		reMatches := re.FindAllSubmatch(filterResponse, -1)
+
+		for _, submatchSlice := range reMatches {
+			unit := &Unit{
+				Id:          string(submatchSlice[1]),
+				Designation: string(submatchSlice[2]),
+			}
+			unitsToSearchFor = append(unitsToSearchFor, unit)
+		}
+	} else {
+		log.Printf("Loading progress file to resume from...\n")
+
+		err = json.Unmarshal(remaining_units_bytes, &unitsToSearchFor)
+		if err != nil {
+			log.Fatalf("Failed to load progress file unit data for resuming search: %v\n", err)
+		}
+
+		log.Printf("Successfully loaded progress file for units to search for, remaining units: %v", len(unitsToSearchFor))
 	}
 
-	for _, unit := range unitsToSearchFor {
-		unit.loadCustomCardDetails()
-		unit.loadUnitOverviewDetails()
-		log.Printf("Loaded details for unit: %+v", *unit)
-	}
+	remainingUnits := unitsToSearchFor[:]
 
-	jsonText, err := json.Marshal(unitsToSearchFor)
+	start := time.Now()
+
+	// write progress to disk incase we need to start back up from an interrupt
+	writeUnitDataChannel := make(chan *Unit)
+
+	f, err := os.OpenFile("unit_scrape_results.json", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
-		log.Fatalf("Failed to marshal units to JSON text for output: %v\n", err)
+		log.Fatalf("Failed to open progress file for dumping processed unit data\n")
 	}
 
-	fmt.Printf("\n%s\n", jsonText)
+	go func() {
+		for unit := range writeUnitDataChannel {
+			jsonText, err := json.Marshal(unit)
+			if err != nil {
+				log.Fatalf("Failed to marshal units to JSON text for output: %v\n", err)
+			}
 
+			// Add a newline to the json text
+			nl := []byte("\n")
+			jsonText = append(jsonText, nl...)
+
+			n, err := f.Write(jsonText)
+			if err != nil {
+				log.Fatalf("Failed to write %v bytes to unit scrape result file: %v\nBytes: %s\n", n, err, jsonText)
+			}
+
+			log.Printf("Successfully wrote %v bytes to unit scrape result file:\n%s\n", n, jsonText)
+
+			i := slices.Index(remainingUnits, unit)
+			remainingUnits = append(remainingUnits[:i], remainingUnits[(i+1):]...)
+
+			remainingUnitsJson, err := json.Marshal(remainingUnits)
+			if err != nil {
+				log.Fatalf("Failed to marshal remaining units to JSON text for output: %v\n", err)
+			}
+
+			err = os.WriteFile("remaining_units.json", remainingUnitsJson, 0644)
+			if err != nil {
+				log.Fatalf("Failed to write remaining units to process to file: %v\n", err)
+			}
+		}
+		log.Printf("Received signal to close channel for writing unit data\n")
+	}()
+
+	defer f.Close()
+
+	maxRequestFlightChan := make(chan int, runtime.GOMAXPROCS(0))
+	numberOfUnitsToProcess := len(unitsToSearchFor)
+	tenPercent := int(math.Ceil((float64(numberOfUnitsToProcess) * 10.0) / 100.0))
+	processedUnitsChan := make(chan int)
+	for i := 0; i < numberOfUnitsToProcess; i++ {
+		unitToProcess := unitsToSearchFor[i]
+
+		if i%tenPercent == 0 {
+			percentComplete := 10 * (i / tenPercent)
+			fmt.Printf("%v%% complete with processing units. Batch size: %v, Current unit number in batch: %v\n", percentComplete, numberOfUnitsToProcess, i)
+		}
+
+		maxRequestFlightChan <- 1
+		go func() {
+			// We do this so that go routines don't inadvertantly share the same unit
+			unit := unitToProcess
+			gostart := time.Now()
+			unit.loadCustomCardDetails()
+			unit.loadUnitOverviewDetails()
+
+			log.Printf("Finished loading details for unit: %v Time spent: %v", unit.Designation, time.Since(gostart))
+
+			writeUnitDataChannel <- unit
+
+			<-maxRequestFlightChan
+			processedUnitsChan <- 1
+		}()
+	}
+
+	// Wait until we've received all the results
+	for i := 0; i < numberOfUnitsToProcess; i++ {
+		<-processedUnitsChan
+	}
+
+	close(writeUnitDataChannel)
+
+	log.Printf("Total time spent processing unit details: %v", time.Since(start))
+
+	// clean up the progress file if necessary
+	os.Remove("remaining_units.json")
 }
 
 func (u *Unit) loadCustomCardDetails() {
+
+	s := time.Now()
+
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return fmt.Errorf("detected redirect when attempting to access client custom card path")
@@ -186,105 +280,40 @@ func (u *Unit) loadCustomCardDetails() {
 		log.Fatalf("Encountered error reading request response: %v\n", err)
 	}
 
+	log.Printf("Time spent making custom card http request: %v\n", time.Since(s))
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Encountered panic while parsing unit ( %v ) field data from html: %v\nStacktrace:\n%s", u.Designation, r, debug.Stack())
 		}
 	}()
 
-	fieldAssignmentChannel := make(chan int, runtime.GOMAXPROCS(0))
-
-	go func() {
-		u.AlphaStrikeCardDetails.Name = getFieldDataForResponseMatcher(customCardResponse, nameRe)
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.Model = getFieldDataForResponseMatcher(customCardResponse, modelRe)
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.PV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, pvRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.TP = getFieldDataForResponseMatcher(customCardResponse, typeRe)
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.SZ, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, sizeRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.MV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, moveRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.ShortDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, shortRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.IsShortMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, shortMinRe), "checked")
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.MediumDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, mediumRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.IsMediumMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, mediumMinRe), "checked")
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.LongDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, longRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.IsLongMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, longMinRe), "checked")
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.ExtremeDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, extremeRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.IsExtremeMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, extremeMinRe), "checked")
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.OV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, ovRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.Armor, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, armorRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.Struc, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, strucRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.Threshold, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, thresholdRe))
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.Specials = getFieldDataForResponseMatcher(customCardResponse, specialsRe)
-		fieldAssignmentChannel <- 1
-	}()
-	go func() {
-		u.AlphaStrikeCardDetails.ImageUrl = getFieldDataForResponseMatcher(customCardResponse, imageRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	// wait for all the assignments to finish
-	for i := 0; i < 20; i++ {
-		<-fieldAssignmentChannel
-	}
+	u.AlphaStrikeCardDetails.Name = getFieldDataForResponseMatcher(customCardResponse, nameRe)
+	u.AlphaStrikeCardDetails.Model = getFieldDataForResponseMatcher(customCardResponse, modelRe)
+	u.AlphaStrikeCardDetails.PV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, pvRe))
+	u.AlphaStrikeCardDetails.TP = getFieldDataForResponseMatcher(customCardResponse, typeRe)
+	u.AlphaStrikeCardDetails.SZ, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, sizeRe))
+	u.AlphaStrikeCardDetails.MV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, moveRe))
+	u.AlphaStrikeCardDetails.ShortDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, shortRe))
+	u.AlphaStrikeCardDetails.IsShortMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, shortMinRe), "checked")
+	u.AlphaStrikeCardDetails.MediumDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, mediumRe))
+	u.AlphaStrikeCardDetails.IsMediumMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, mediumMinRe), "checked")
+	u.AlphaStrikeCardDetails.LongDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, longRe))
+	u.AlphaStrikeCardDetails.IsLongMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, longMinRe), "checked")
+	u.AlphaStrikeCardDetails.ExtremeDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, extremeRe))
+	u.AlphaStrikeCardDetails.IsExtremeMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, extremeMinRe), "checked")
+	u.AlphaStrikeCardDetails.OV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, ovRe))
+	u.AlphaStrikeCardDetails.Armor, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, armorRe))
+	u.AlphaStrikeCardDetails.Struc, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, strucRe))
+	u.AlphaStrikeCardDetails.Threshold, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, thresholdRe))
+	u.AlphaStrikeCardDetails.Specials = getFieldDataForResponseMatcher(customCardResponse, specialsRe)
+	u.AlphaStrikeCardDetails.ImageUrl = getFieldDataForResponseMatcher(customCardResponse, imageRe)
 }
 
 func getFieldDataForResponseMatcher(response []byte, matcher *regexp.Regexp) string {
 	subMatches := matcher.FindAllSubmatch(response, -1)
 	if subMatches == nil {
-		log.Printf("Failed to find any submatches using regex: %+v\n", *matcher)
+		// log.Printf("Failed to find any submatches using regex: %+v\n", *matcher)
 		return ""
 	}
 	defer func() {
@@ -296,6 +325,8 @@ func getFieldDataForResponseMatcher(response []byte, matcher *regexp.Regexp) str
 }
 
 func (u *Unit) loadUnitOverviewDetails() {
+	s := time.Now()
+
 	response, err := http.Get(fmt.Sprintf("%v%v/%v/%v", config.ScrapeBaseUrl, config.UnitDetailPath, u.Id, u.Designation))
 	if err != nil {
 		log.Fatalf("Encountered error making request to MLU: %v\n", err)
@@ -308,60 +339,16 @@ func (u *Unit) loadUnitOverviewDetails() {
 		log.Fatalf("Encountered error reading request response: %v\n", err)
 	}
 
-	fieldAssignmentChannel := make(chan int, runtime.GOMAXPROCS(0))
+	log.Printf("Time spent making unit overview http request: %v\n", time.Since(s))
 
-	go func() {
-		u.UnitOverview.BattleValue, _ = strconv.Atoi(strings.Join(strings.Split(getFieldDataForResponseMatcher(detailResponse, battleValueRe), ","), ""))
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.Cost, _ = strconv.Atoi(strings.Join(strings.Split(getFieldDataForResponseMatcher(detailResponse, costRe), ","), ""))
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.DateIntroduced, _ = strconv.Atoi(getFieldDataForResponseMatcher(detailResponse, dateIntroducedRe))
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.Era = getFieldDataForResponseMatcher(detailResponse, eraRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.Notes = getFieldDataForResponseMatcher(detailResponse, notesRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.RulesLevel = getFieldDataForResponseMatcher(detailResponse, rulesLevelRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.Technology = getFieldDataForResponseMatcher(detailResponse, technologyRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.Tonnage, _ = strconv.Atoi(getFieldDataForResponseMatcher(detailResponse, tonnageRe))
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.UnitRole = getFieldDataForResponseMatcher(detailResponse, unitRoleRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	go func() {
-		u.UnitOverview.UnitType = getFieldDataForResponseMatcher(detailResponse, unitTypeRe)
-		fieldAssignmentChannel <- 1
-	}()
-
-	// wait for all the assignments to finish
-	for i := 0; i < 10; i++ {
-		<-fieldAssignmentChannel
-	}
+	u.UnitOverview.BattleValue, _ = strconv.Atoi(strings.Join(strings.Split(getFieldDataForResponseMatcher(detailResponse, battleValueRe), ","), ""))
+	u.UnitOverview.Cost, _ = strconv.Atoi(strings.Join(strings.Split(getFieldDataForResponseMatcher(detailResponse, costRe), ","), ""))
+	u.UnitOverview.DateIntroduced, _ = strconv.Atoi(getFieldDataForResponseMatcher(detailResponse, dateIntroducedRe))
+	u.UnitOverview.Era = getFieldDataForResponseMatcher(detailResponse, eraRe)
+	u.UnitOverview.Notes = getFieldDataForResponseMatcher(detailResponse, notesRe)
+	u.UnitOverview.RulesLevel = getFieldDataForResponseMatcher(detailResponse, rulesLevelRe)
+	u.UnitOverview.Technology = getFieldDataForResponseMatcher(detailResponse, technologyRe)
+	u.UnitOverview.Tonnage, _ = strconv.Atoi(getFieldDataForResponseMatcher(detailResponse, tonnageRe))
+	u.UnitOverview.UnitRole = getFieldDataForResponseMatcher(detailResponse, unitRoleRe)
+	u.UnitOverview.UnitType = getFieldDataForResponseMatcher(detailResponse, unitTypeRe)
 }
