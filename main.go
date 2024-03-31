@@ -170,6 +170,7 @@ func main() {
 
 	// write progress to disk incase we need to start back up from an interrupt
 	writeUnitDataChannel := make(chan *Unit)
+	writeUnitDataFinished := make(chan int)
 
 	f, err := os.OpenFile("unit_scrape_results.json", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
@@ -177,8 +178,10 @@ func main() {
 	}
 
 	go func() {
-		for unit := range writeUnitDataChannel {
-			jsonText, err := json.Marshal(unit)
+		for unitToWrite := range writeUnitDataChannel {
+			log.Printf("Received unit to write to json file: \n\n%+v\n\n", *unitToWrite)
+
+			jsonText, err := json.Marshal(unitToWrite)
 			if err != nil {
 				log.Fatalf("Failed to marshal units to JSON text for output: %v\n", err)
 			}
@@ -194,59 +197,72 @@ func main() {
 
 			log.Printf("Successfully wrote %v bytes to unit scrape result file:\n%s\n", n, jsonText)
 
-			i := slices.Index(remainingUnits, unit)
-			remainingUnits = append(remainingUnits[:i], remainingUnits[(i+1):]...)
+			i := slices.Index(remainingUnits, unitToWrite)
+			if i != -1 {
+				remainingUnits = append(remainingUnits[:i], remainingUnits[(i+1):]...)
 
-			remainingUnitsJson, err := json.Marshal(remainingUnits)
-			if err != nil {
-				log.Fatalf("Failed to marshal remaining units to JSON text for output: %v\n", err)
-			}
+				remainingUnitsJson, err := json.Marshal(remainingUnits)
+				if err != nil {
+					log.Fatalf("Failed to marshal remaining units to JSON text for output: %v\n", err)
+				}
 
-			err = os.WriteFile("remaining_units.json", remainingUnitsJson, 0644)
-			if err != nil {
-				log.Fatalf("Failed to write remaining units to process to file: %v\n", err)
+				err = os.WriteFile("remaining_units.json", remainingUnitsJson, 0644)
+				if err != nil {
+					log.Fatalf("Failed to write remaining units to process to file: %v\n", err)
+				}
 			}
 		}
 		log.Printf("Received signal to close channel for writing unit data\n")
+		writeUnitDataFinished <- 1
 	}()
 
 	defer f.Close()
 
-	maxRequestFlightChan := make(chan int, runtime.GOMAXPROCS(0))
-	numberOfUnitsToProcess := len(unitsToSearchFor)
-	tenPercent := int(math.Ceil((float64(numberOfUnitsToProcess) * 10.0) / 100.0))
-	processedUnitsChan := make(chan int)
-	for i := 0; i < numberOfUnitsToProcess; i++ {
-		unitToProcess := unitsToSearchFor[i]
-
-		if i%tenPercent == 0 {
-			percentComplete := 10 * (i / tenPercent)
-			fmt.Printf("%v%% complete with processing units. Batch size: %v, Current unit number in batch: %v\n", percentComplete, numberOfUnitsToProcess, i)
-		}
-
-		maxRequestFlightChan <- 1
+	// Launch n many go routines for scraping unit details
+	unitProcessingChan := make(chan *Unit, len(unitsToSearchFor))
+	processedUnitsChan := make(chan int, len(unitsToSearchFor))
+	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
 		go func() {
 			// We do this so that go routines don't inadvertantly share the same unit
-			unit := unitToProcess
-			gostart := time.Now()
-			unit.loadCustomCardDetails()
-			unit.loadUnitOverviewDetails()
+			for unit := range unitProcessingChan {
+				gostart := time.Now()
+				unit.loadCustomCardDetails()
+				unit.loadUnitOverviewDetails()
 
-			log.Printf("Finished loading details for unit: %v Time spent: %v", unit.Designation, time.Since(gostart))
+				log.Printf("Finished loading details for unit: %v Time spent: %v", unit.Designation, time.Since(gostart))
 
-			writeUnitDataChannel <- unit
+				writeUnitDataChannel <- unit
+				log.Printf("Wrote unit to write unit data channel\n")
 
-			<-maxRequestFlightChan
-			processedUnitsChan <- 1
+				processedUnitsChan <- 1
+				log.Printf("Wrote signal to processed units channel\n")
+			}
 		}()
 	}
 
-	// Wait until we've received all the results
+	numberOfUnitsToProcess := len(unitsToSearchFor)
 	for i := 0; i < numberOfUnitsToProcess; i++ {
-		<-processedUnitsChan
+		unitToProcess := unitsToSearchFor[i]
+		unitProcessingChan <- unitToProcess
 	}
 
+	log.Printf("Loaded up all units for processing\n")
+
+	// Wait until we've received all the results
+	tenPercent := int(math.Ceil((float64(numberOfUnitsToProcess) * 10.0) / 100.0))
+	for i := 0; i < numberOfUnitsToProcess; i += <-processedUnitsChan {
+		if i%tenPercent == 0 {
+			percentComplete := 10 * (i / tenPercent)
+			log.Printf("%v%% complete with processing units. Batch size: %v, Current unit number in batch: %v\n", percentComplete, numberOfUnitsToProcess, i)
+		}
+	}
+
+	// Close up the scraping channel
+	close(unitProcessingChan)
+
+	// Close up the send channel and wait for it to tell us its done writing
 	close(writeUnitDataChannel)
+	<-writeUnitDataFinished
 
 	log.Printf("Total time spent processing unit details: %v", time.Since(start))
 
