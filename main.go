@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +13,6 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -109,135 +110,24 @@ func main() {
 
 	log.Printf("Welcome to the mlu-scraper, go get yourself some Alphastrike data!\n")
 
-	configBytes, err := os.ReadFile("config.json")
-	if err != nil {
-		log.Fatalf("Encountered error reading configuration file: %v\n", err)
-	}
+	config = loadConfig()
 
-	config = Config{}
-	if err := json.Unmarshal(configBytes, &config); err != nil {
-		log.Fatalf("Encountered error unmarshalling JSON config file to config object: %v\n", err)
-	}
+	alreadyFoundUnitsMap := loadAlreadyScrapedUnits()
 
-	log.Printf("Successfully read configuration file: %+v\n", config)
-
-	unitsToSearchFor := []*Unit{}
-
-	remaining_units_bytes, err := os.ReadFile("remaining_units.json")
-	if err != nil && os.IsNotExist(err) {
-		log.Printf("Didn't detect any progress files to resume from, starting a fresh filter request\n")
-		// Make unit filter request
-		response, err := http.Get(fmt.Sprintf("%v%v?%v", config.ScrapeBaseUrl, config.UnitFilterPath, config.BattleMechFilter))
-		if err != nil {
-			log.Fatalf("Encountered error making request to MLU: %v\n", err)
-		}
-
-		defer response.Body.Close()
-
-		filterResponse, err := io.ReadAll(response.Body)
-		if err != nil {
-			log.Fatalf("Encountered error reading request response: %v\n", err)
-		}
-
-		re, err := regexp.Compile(`"/Unit/Details/(\d+)/(.*)"`)
-		if err != nil {
-			log.Fatalf("Failed to compile regexp for matching against scraped page: %v\n", err)
-		}
-
-		reMatches := re.FindAllSubmatch(filterResponse, -1)
-
-		for _, submatchSlice := range reMatches {
-			unit := &Unit{
-				Id:          string(submatchSlice[1]),
-				Designation: string(submatchSlice[2]),
-			}
-			unitsToSearchFor = append(unitsToSearchFor, unit)
-		}
-	} else {
-		log.Printf("Loading progress file to resume from...\n")
-
-		err = json.Unmarshal(remaining_units_bytes, &unitsToSearchFor)
-		if err != nil {
-			log.Fatalf("Failed to load progress file unit data for resuming search: %v\n", err)
-		}
-
-		log.Printf("Successfully loaded progress file for units to search for, remaining units: %v", len(unitsToSearchFor))
-	}
-
-	remainingUnits := unitsToSearchFor[:]
+	unitsToSearchFor := loadUnitsToSearchFor(alreadyFoundUnitsMap)
 
 	start := time.Now()
 
 	// write progress to disk incase we need to start back up from an interrupt
-	writeUnitDataChannel := make(chan *Unit)
-	writeUnitDataFinished := make(chan int)
-
-	f, err := os.OpenFile("unit_scrape_results.json", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
-	if err != nil {
-		log.Fatalf("Failed to open progress file for dumping processed unit data\n")
-	}
-
-	go func() {
-		for unitToWrite := range writeUnitDataChannel {
-			log.Printf("Received unit to write to json file: \n\n%+v\n\n", *unitToWrite)
-
-			jsonText, err := json.Marshal(unitToWrite)
-			if err != nil {
-				log.Fatalf("Failed to marshal units to JSON text for output: %v\n", err)
-			}
-
-			// Add a newline to the json text
-			nl := []byte("\n")
-			jsonText = append(jsonText, nl...)
-
-			n, err := f.Write(jsonText)
-			if err != nil {
-				log.Fatalf("Failed to write %v bytes to unit scrape result file: %v\nBytes: %s\n", n, err, jsonText)
-			}
-
-			log.Printf("Successfully wrote %v bytes to unit scrape result file:\n%s\n", n, jsonText)
-
-			i := slices.Index(remainingUnits, unitToWrite)
-			if i != -1 {
-				remainingUnits = append(remainingUnits[:i], remainingUnits[(i+1):]...)
-
-				remainingUnitsJson, err := json.Marshal(remainingUnits)
-				if err != nil {
-					log.Fatalf("Failed to marshal remaining units to JSON text for output: %v\n", err)
-				}
-
-				err = os.WriteFile("remaining_units.json", remainingUnitsJson, 0644)
-				if err != nil {
-					log.Fatalf("Failed to write remaining units to process to file: %v\n", err)
-				}
-			}
-		}
-		log.Printf("Received signal to close channel for writing unit data\n")
-		writeUnitDataFinished <- 1
-	}()
-
-	defer f.Close()
+	writeUnitDataChan := make(chan *Unit)
+	writeUnitDataFinishedChan := make(chan int)
+	go startDataDumpingProcessor(writeUnitDataChan, writeUnitDataFinishedChan)
 
 	// Launch n many go routines for scraping unit details
 	unitProcessingChan := make(chan *Unit, len(unitsToSearchFor))
 	processedUnitsChan := make(chan int, len(unitsToSearchFor))
 	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
-		go func() {
-			// We do this so that go routines don't inadvertantly share the same unit
-			for unit := range unitProcessingChan {
-				gostart := time.Now()
-				unit.loadCustomCardDetails()
-				unit.loadUnitOverviewDetails()
-
-				log.Printf("Finished loading details for unit: %v Time spent: %v", unit.Designation, time.Since(gostart))
-
-				writeUnitDataChannel <- unit
-				log.Printf("Wrote unit to write unit data channel\n")
-
-				processedUnitsChan <- 1
-				log.Printf("Wrote signal to processed units channel\n")
-			}
-		}()
+		go startUnitScraper(unitProcessingChan, writeUnitDataChan, processedUnitsChan)
 	}
 
 	numberOfUnitsToProcess := len(unitsToSearchFor)
@@ -262,13 +152,139 @@ func main() {
 	close(unitProcessingChan)
 
 	// Close up the send channel and wait for it to tell us its done writing
-	close(writeUnitDataChannel)
-	<-writeUnitDataFinished
+	close(writeUnitDataChan)
+	<-writeUnitDataFinishedChan
 
 	log.Printf("Total time spent processing unit details: %v", time.Since(start))
+}
 
-	// clean up the progress file if necessary
-	os.Remove("remaining_units.json")
+func loadConfig() Config {
+	configBytes, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatalf("Encountered error reading configuration file: %v\n", err)
+	}
+
+	c := Config{}
+	if err := json.Unmarshal(configBytes, &c); err != nil {
+		log.Fatalf("Encountered error unmarshalling JSON config file to config object: %v\n", err)
+	}
+
+	log.Printf("Successfully read configuration file: %+v\n", c)
+
+	return c
+}
+
+func loadAlreadyScrapedUnits() map[string]int {
+	alreadyFoundUnitsMap := map[string]int{}
+	remaining_units_bytes, err := os.ReadFile("unit_scrape_results.json")
+	if err == nil {
+		log.Printf("Loading pre-existing dump file to attempt to resume from...\n")
+
+		scanner := bufio.NewScanner(bytes.NewReader(remaining_units_bytes))
+		for scanner.Scan() {
+			unit := &Unit{}
+			err = json.Unmarshal(bytes.TrimSpace(scanner.Bytes()), unit)
+			if err != nil {
+				log.Fatalf("Failed to load pre-existing file unit data for resuming search: %v\n", err)
+			}
+			alreadyFoundUnitsMap[unit.Id] = 1
+		}
+
+		log.Printf("Successfully loaded pre-existing file for units already found: %v\n", alreadyFoundUnitsMap)
+	}
+
+	return alreadyFoundUnitsMap
+}
+
+func startDataDumpingProcessor(writeUnitDataChan chan *Unit, writeUnitDataFinishedChan chan int) {
+	f, err := os.OpenFile("unit_scrape_results.json", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open progress file for dumping processed unit data\n")
+	}
+	defer f.Close()
+
+	for unitToWrite := range writeUnitDataChan {
+		log.Printf("Received unit to write to json file: \n\n%+v\n\n", *unitToWrite)
+
+		jsonText, err := json.Marshal(unitToWrite)
+		if err != nil {
+			log.Fatalf("Failed to marshal units to JSON text for output: %v\n", err)
+		}
+
+		// Add a newline to the json text
+		nl := []byte("\n")
+		jsonText = append(jsonText, nl...)
+
+		n, err := f.Write(jsonText)
+		if err != nil {
+			log.Fatalf("Failed to write %v bytes to unit scrape result file: %v\nBytes: %s\n", n, err, jsonText)
+		}
+
+		log.Printf("Successfully wrote %v bytes to unit scrape result file:\n%s\n", n, jsonText)
+	}
+
+	log.Printf("Received signal to close channel for writing unit data, sending finished signal to main process\n")
+
+	writeUnitDataFinishedChan <- 1
+}
+
+func startUnitScraper(unitsToProcess chan *Unit, writeDataToFile chan *Unit, notifyMainCallerOfProcessedUnit chan int) {
+	// We do this so that go routines don't inadvertantly share the same unit
+	for unit := range unitsToProcess {
+		gostart := time.Now()
+		unit.loadCustomCardDetails()
+		unit.loadUnitOverviewDetails()
+
+		if unit.AlphaStrikeCardDetails.Role == "" {
+			unit.AlphaStrikeCardDetails.Role = unit.UnitOverview.UnitRole
+		}
+
+		log.Printf("Finished loading details for unit: %v Time spent: %v", unit.Designation, time.Since(gostart))
+
+		writeDataToFile <- unit
+		log.Printf("Wrote unit to write unit data channel\n")
+
+		notifyMainCallerOfProcessedUnit <- 1
+		log.Printf("Wrote signal to processed units channel\n")
+	}
+}
+
+func loadUnitsToSearchFor(alreadyFoundUnitsMap map[string]int) []*Unit {
+	unitsToSearchFor := []*Unit{}
+
+	// Make unit filter request
+	response, err := http.Get(fmt.Sprintf("%v%v?%v", config.ScrapeBaseUrl, config.UnitFilterPath, config.BattleMechFilter))
+	if err != nil {
+		log.Fatalf("Encountered error making request to MLU: %v\n", err)
+	}
+
+	defer response.Body.Close()
+
+	filterResponse, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Fatalf("Encountered error reading request response: %v\n", err)
+	}
+
+	re, err := regexp.Compile(`"/Unit/Details/(\d+)/(.*)"`)
+	if err != nil {
+		log.Fatalf("Failed to compile regexp for matching against scraped page: %v\n", err)
+	}
+
+	reMatches := re.FindAllSubmatch(filterResponse, -1)
+
+	for _, submatchSlice := range reMatches {
+		if _, ok := alreadyFoundUnitsMap[string(submatchSlice[1])]; !ok {
+			unit := &Unit{
+				Id:          string(submatchSlice[1]),
+				Designation: string(submatchSlice[2]),
+			}
+			unitsToSearchFor = append(unitsToSearchFor, unit)
+		} else {
+			log.Printf("Detected already scraper unit: %v - %v, skipping scrape for it\n", string(submatchSlice[1]), string(submatchSlice[2]))
+		}
+	}
+
+	return unitsToSearchFor
 }
 
 func (u *Unit) loadCustomCardDetails() {
