@@ -39,7 +39,7 @@ type AlphaStrikeCard struct {
 	PV                 int
 	TP                 string
 	SZ                 int
-	MV                 int
+	MV                 string
 	Role               string
 	Skill              int
 	ShortDamage        int
@@ -326,7 +326,7 @@ func (u *Unit) loadCustomCardDetails() {
 	u.AlphaStrikeCardDetails.PV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, pvRe))
 	u.AlphaStrikeCardDetails.TP = getFieldDataForResponseMatcher(customCardResponse, typeRe)
 	u.AlphaStrikeCardDetails.SZ, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, sizeRe))
-	u.AlphaStrikeCardDetails.MV, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, moveRe))
+	u.AlphaStrikeCardDetails.MV = getFieldDataForResponseMatcher(customCardResponse, moveRe)
 	u.AlphaStrikeCardDetails.ShortDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, shortRe))
 	u.AlphaStrikeCardDetails.IsShortMinDamage = strings.Contains(getFieldDataForResponseMatcher(customCardResponse, shortMinRe), "checked")
 	u.AlphaStrikeCardDetails.MediumDamage, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, mediumRe))
