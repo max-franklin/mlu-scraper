@@ -257,7 +257,8 @@ func main() {
 		}
 	}
 
-	// Close up the scraping channel
+	// Close up the scraping channel, not strictly necessary since
+	// we're waiting for all the units to be processed first.
 	close(unitProcessingChan)
 
 	// Close up the send channel and wait for it to tell us its done writing
@@ -324,6 +325,7 @@ func (u *Unit) loadCustomCardDetails() {
 	u.AlphaStrikeCardDetails.Threshold, _ = strconv.Atoi(getFieldDataForResponseMatcher(customCardResponse, thresholdRe))
 	u.AlphaStrikeCardDetails.Specials = getFieldDataForResponseMatcher(customCardResponse, specialsRe)
 	u.AlphaStrikeCardDetails.ImageUrl = getFieldDataForResponseMatcher(customCardResponse, imageRe)
+	u.AlphaStrikeCardDetails.Skill = 4
 }
 
 func getFieldDataForResponseMatcher(response []byte, matcher *regexp.Regexp) string {
